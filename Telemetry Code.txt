@@ -1,0 +1,407 @@
+/*
+ TLV MK-01 COMPLETE TELEMETRY FIRMWARE
+ STM32F411CEU6 Black Pill + SHT31 + MS5611 + MPU6050 + ADXL375 + NEO-M8N + SiK
+
+ I2C1: PB6=SCL, PB7=SDA
+ UART2 GPS: PA2=TX, PA3=RX
+ UART1 SiK: PA9=TX, PA10=RX
+ USB Serial: 115200
+
+ Packet:
+ $TLV,SEQ,TEMP,HUM,PRES_HPA,ALT_BARO,MPU_AX,MPU_AY,MPU_AZ,
+ GYRO_X,GYRO_Y,GYRO_Z,ADXL_X,ADXL_Y,ADXL_Z,
+ GPS_FIX,GPS_SATS,GPS_LAT,GPS_LON,GPS_ALT,GPS_SPEED,GPS_COURSE,
+ STATUS,RSSI,BATT,CRC
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+
+#define I2C_SCL_PIN PB_6
+#define I2C_SDA_PIN PB_7
+
+Uart GPSSerial(PA_3, PA_2);   // RX, TX
+Uart SiKSerial(PA_10, PA_9);  // RX, TX
+
+// Sensor address auto-detection variables (default and alternative addresses supported)
+uint8_t sht31Addr  = 0x44; // 0x44 or 0x45
+uint8_t mpuAddr    = 0x68; // 0x68 or 0x69
+uint8_t adxlAddr   = 0x1D; // 0x1D (SDO=VCC) or 0x53 (SDO=GND)
+uint8_t msAddr     = 0x77; // 0x77 (CSB=VCC) or 0x76 (CSB=GND)
+
+#define BATTERY_ADC_ENABLED false
+#define BATTERY_ADC_PIN PB_0
+#define BATTERY_R1 100000.0f
+#define BATTERY_R2 33000.0f
+
+uint32_t seqNo=0, lastTelemetry=0, lastSensor=0, lastRetry=0;
+bool shtOK=false,msOK=false,mpuOK=false,adxlOK=false;
+float temperatureC=NAN,humidity=NAN,pressureHpa=NAN,baroAltM=NAN;
+float mpuAx=NAN,mpuAy=NAN,mpuAz=NAN,gyroX=NAN,gyroY=NAN,gyroZ=NAN;
+float adxlX=NAN,adxlY=NAN,adxlZ=NAN;
+int gpsFix=0,gpsSats=0;
+double gpsLat=0,gpsLon=0;
+float gpsAlt=0,gpsSpeed=0,gpsCourse=0;
+int radioRssi=-999;
+float batteryV=NAN;
+char gpsLine[180]; uint16_t gpsIdx=0;
+float rollDeg=0,pitchDeg=0,yawDeg=0; uint32_t lastOrient=0;
+
+uint16_t crc16(const String&s){
+  uint16_t c=0xFFFF;
+  for(size_t i=0;i<s.length();++i){
+    c ^= ((uint16_t)(uint8_t)s[i])<<8;
+    for(int j=0;j<8;j++) c=(c&0x8000)?((c<<1)^0x1021):(c<<1);
+  }
+  return c;
+}
+void recoverI2C(){
+  Wire.end();
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  // Pulse SCL up to 16 times to clock out any slave holding SDA low
+  for(int i=0; i<16; i++){
+    digitalWrite(I2C_SCL_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+    if(digitalRead(I2C_SDA_PIN) == HIGH) break;
+  }
+  // Generate STOP condition
+  pinMode(I2C_SDA_PIN, OUTPUT);
+  digitalWrite(I2C_SDA_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SCL_PIN, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SDA_PIN, HIGH);
+  delayMicroseconds(5);
+
+  Wire.setSCL(I2C_SCL_PIN);
+  Wire.setSDA(I2C_SDA_PIN);
+  Wire.begin();
+  Wire.setClock(100000);
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(25000, true);
+#endif
+}
+
+bool wreg(uint8_t a,uint8_t r,uint8_t v){
+  Wire.beginTransmission(a); Wire.write(r); Wire.write(v);
+  if(Wire.endTransmission()!=0){
+    recoverI2C();
+    return false;
+  }
+  return true;
+}
+bool rreg(uint8_t a,uint8_t r,uint8_t*b,size_t n){
+  Wire.beginTransmission(a); Wire.write(r);
+  if(Wire.endTransmission()!=0){
+    recoverI2C();
+    return false;
+  }
+  if(Wire.requestFrom(a,(uint8_t)n)!=n){
+    recoverI2C();
+    return false;
+  }
+  for(size_t i=0;i<n;i++)b[i]=Wire.read();
+  return true;
+}
+
+/* SHT31 */
+bool initSHT(){
+  sht31Addr = 0x44;
+  Wire.beginTransmission(sht31Addr); Wire.write(0x30); Wire.write(0xA2);
+  if(Wire.endTransmission()!=0){
+    sht31Addr = 0x45;
+    Wire.beginTransmission(sht31Addr); Wire.write(0x30); Wire.write(0xA2);
+    if(Wire.endTransmission()!=0){
+      recoverI2C();
+      return false;
+    }
+  }
+  delay(5);
+  return true;
+}
+bool readSHT(){
+  Wire.beginTransmission(sht31Addr); Wire.write(0x24); Wire.write(0x00);
+  if(Wire.endTransmission()!=0){
+    recoverI2C();
+    return false;
+  }
+  delay(20);
+  if(Wire.requestFrom(sht31Addr,(uint8_t)6)!=6){
+    recoverI2C();
+    return false;
+  }
+  uint8_t b[6];
+  for(int i=0;i<6;i++)b[i]=Wire.read();
+  uint16_t t=((uint16_t)b[0]<<8)|b[1],h=((uint16_t)b[3]<<8)|b[4];
+  temperatureC=-45.0f+175.0f*(float)t/65535.0f;
+  humidity=100.0f*(float)h/65535.0f;
+  return true;
+}
+
+/* MPU6050 */
+bool initMPU(){
+  mpuAddr = 0x68;
+  if(!wreg(mpuAddr,0x6B,0x00)){
+    mpuAddr = 0x69;
+    if(!wreg(mpuAddr,0x6B,0x00)) return false;
+  }
+  delay(10);
+  wreg(mpuAddr,0x1B,0x00); // 250 deg/s
+  wreg(mpuAddr,0x1C,0x00); // 2g
+  wreg(mpuAddr,0x1A,0x03); // DLPF 42Hz
+  return true;
+}
+bool readMPU(){
+  uint8_t b[14];
+  if(!rreg(mpuAddr,0x3B,b,14)) return false;
+  int16_t ax=((int16_t)b[0]<<8)|b[1];
+  int16_t ay=((int16_t)b[2]<<8)|b[3];
+  int16_t az=((int16_t)b[4]<<8)|b[5];
+  int16_t gx=((int16_t)b[8]<<8)|b[9];
+  int16_t gy=((int16_t)b[10]<<8)|b[11];
+  int16_t gz=((int16_t)b[12]<<8)|b[13];
+  mpuAx=ax/16384.0f;mpuAy=ay/16384.0f;mpuAz=az/16384.0f;
+  gyroX=gx/131.0f;gyroY=gy/131.0f;gyroZ=gz/131.0f;
+  return true;
+}
+
+/* ADXL375 */
+bool initADXL(){
+  uint8_t id=0;
+  adxlAddr = 0x1D;
+  if(!rreg(adxlAddr,0x00,&id,1)||id!=0xE5){
+    adxlAddr = 0x53; // Check alternate address
+    if(!rreg(adxlAddr,0x00,&id,1)||id!=0xE5) return false;
+  }
+  wreg(adxlAddr,0x2D,0x08); // Measurement mode
+  wreg(adxlAddr,0x31,0x0B); // Full resolution, +/- 200g
+  return true;
+}
+bool readADXL(){
+  uint8_t b[6];
+  if(!rreg(adxlAddr,0x32,b,6)) return false;
+  int16_t x=((int16_t)b[1]<<8)|b[0];
+  int16_t y=((int16_t)b[3]<<8)|b[2];
+  int16_t z=((int16_t)b[5]<<8)|b[4];
+  adxlX=x*0.049f;adxlY=y*0.049f;adxlZ=z*0.049f;
+  return true;
+}
+
+/* MS5611 */
+uint16_t C[7];
+bool msCmd(uint8_t c){
+  Wire.beginTransmission(msAddr);
+  Wire.write(c);
+  if(Wire.endTransmission()!=0){
+    recoverI2C();
+    return false;
+  }
+  return true;
+}
+bool msProm(){
+  for(int i=0;i<7;i++){
+    uint8_t b[2];
+    if(!rreg(msAddr,0xA0+2*i,b,2)) return false;
+    C[i]=((uint16_t)b[0]<<8)|b[1];
+  }
+  return C[1]&&C[2]&&C[3]&&C[4]&&C[5]&&C[6];
+}
+bool msADC(uint32_t&v){
+  // MS5611 ADC read REQUIRES command 0x00 to be sent before reading the 3 bytes
+  Wire.beginTransmission(msAddr);
+  Wire.write(0x00);
+  if(Wire.endTransmission()!=0){
+    recoverI2C();
+    return false;
+  }
+  if(Wire.requestFrom((uint8_t)msAddr,(uint8_t)3)!=(uint8_t)3){
+    recoverI2C();
+    return false;
+  }
+  uint8_t b[3];
+  for(uint8_t i=0;i<3;i++) b[i]=Wire.read();
+  v=((uint32_t)b[0]<<16)|((uint32_t)b[1]<<8)|b[2];
+  return true;
+}
+bool initMS(){
+  msAddr = 0x77;
+  if(!msCmd(0x1E)){
+    msAddr = 0x76; // Check alternate address
+    if(!msCmd(0x1E)) return false;
+  }
+  delay(15);
+  return msProm();
+}
+bool readMS(){
+  if(!msCmd(0x48)) return false;
+  delay(15); // Wait 15ms (OSR 4096 needs 9.04ms max)
+  uint32_t D1=0;
+  if(!msADC(D1)) return false;
+
+  if(!msCmd(0x58)) return false;
+  delay(15); // Wait 15ms (OSR 4096 needs 9.04ms max)
+  uint32_t D2=0;
+  if(!msADC(D2)) return false;
+
+  int64_t dT=(int64_t)D2-((int64_t)C[5]<<8);
+  int64_t T=2000+dT*(int64_t)C[6]/8388608LL;
+  int64_t OFF=((int64_t)C[2]<<16)+dT*(int64_t)C[4]/128LL;
+  int64_t SENS=((int64_t)C[1]<<15)+dT*(int64_t)C[3]/256LL;
+  int64_t T2=0,O2=0,S2=0;
+  if(T<2000){
+    T2=dT*dT/2147483648LL;
+    int64_t t=T-2000;
+    O2=5*t*t/2;
+    S2=5*t*t/4;
+    if(T<-1500){
+      int64_t q=T+1500;
+      O2+=7*q*q;
+      S2+=11*q*q/2;
+    }
+  }
+  T-=T2;OFF-=O2;SENS-=S2;
+  int64_t P=(((int64_t)D1*SENS/2097152LL)-OFF)/32768LL;
+  pressureHpa=P/100.0f;
+  if(pressureHpa>1.0f) baroAltM=44330.0f*(1.0f-pow(pressureHpa/1013.25f,0.190295f));
+  return true;
+}
+
+/* GPS NMEA */
+String fld(const String&s,int n){
+  int st=0,k=0;for(int i=0;i<=s.length();i++){if(i==s.length()||s[i]==','){if(k==n)return s.substring(st,i);k++;st=i+1;}}return "";
+}
+double coord(const String&v,const String&h){
+  if(v.length()<4)return 0;double x=v.toFloat();int d=(int)(x/100);double z=d+(x-d*100)/60.0;if(h=="S"||h=="W")z=-z;return z;
+}
+void parseGPS(const String&s){
+  if(s.startsWith("$GNGGA")||s.startsWith("$GPGGA")){
+    gpsFix=fld(s,6).toInt();gpsSats=fld(s,7).toInt();
+    gpsLat=coord(fld(s,2),fld(s,3));gpsLon=coord(fld(s,4),fld(s,5));gpsAlt=fld(s,9).toFloat();
+  }else if(s.startsWith("$GNRMC")||s.startsWith("$GPRMC")){
+    if(fld(s,2)=="A"){gpsSpeed=fld(s,7).toFloat()*0.514444f;gpsCourse=fld(s,8).toFloat();}
+  }
+}
+void serviceGPS(){
+  while(GPSSerial.available()){
+    char c=GPSSerial.read();if(c=='\r')continue;
+    if(c=='\n'){gpsLine[gpsIdx]=0;if(gpsIdx>6)parseGPS(String(gpsLine));gpsIdx=0;}
+    else if(gpsIdx<sizeof(gpsLine)-1)gpsLine[gpsIdx++]=c;
+  }
+}
+
+/* Orientation: roll/pitch from accel+gyro; yaw is gyro integrated and GPS course aided only while moving. */
+void updateOrientation(){
+  uint32_t now=millis();if(!lastOrient){lastOrient=now;return;}
+  float dt=(now-lastOrient)/1000.0f;lastOrient=now;
+  float ar=atan2f(mpuAy,mpuAz)*180/PI;
+  float ap=atan2f(-mpuAx,sqrtf(mpuAy*mpuAy+mpuAz*mpuAz))*180/PI;
+  rollDeg=0.98f*(rollDeg+gyroX*dt)+0.02f*ar;
+  pitchDeg=0.98f*(pitchDeg+gyroY*dt)+0.02f*ap;
+  if(gpsFix>0&&gpsSpeed>1){float d=fmodf(gpsCourse-yawDeg+540,360)-180;yawDeg+=0.03f*d;}
+  else yawDeg+=gyroZ*dt;
+  yawDeg=fmodf(yawDeg+360,360);
+}
+String nf(float x,int d){return isnan(x)?"nan":String(x,d);}
+String packet(){
+  uint16_t st=0;if(shtOK)st|=1;if(msOK)st|=2;if(mpuOK)st|=4;if(adxlOK)st|=8;if(gpsFix>0)st|=16;
+  String p="$TLV,"+String(seqNo)+","+nf(temperatureC,2)+","+nf(humidity,2)+","+nf(pressureHpa,2)+","+nf(baroAltM,2)+
+  ","+nf(mpuAx,4)+","+nf(mpuAy,4)+","+nf(mpuAz,4)+","+nf(gyroX,3)+","+nf(gyroY,3)+","+nf(gyroZ,3)+
+  ","+nf(adxlX,3)+","+nf(adxlY,3)+","+nf(adxlZ,3)+","+String(gpsFix)+","+String(gpsSats)+
+  ","+String(gpsLat,7)+","+String(gpsLon,7)+","+nf(gpsAlt,2)+","+nf(gpsSpeed,2)+","+nf(gpsCourse,2)+
+  ","+String(st)+","+String(radioRssi)+","+nf(batteryV,2);
+  char h[5];sprintf(h,"%04X",crc16(p));return p+","+String(h);
+}
+void readBattery(){
+#if BATTERY_ADC_ENABLED
+  uint16_t raw=analogRead(BATTERY_ADC_PIN);float va=raw/4095.0f*3.3f;
+  batteryV=va*(BATTERY_R1+BATTERY_R2)/BATTERY_R2;
+#else
+  batteryV=NAN;
+#endif
+}
+
+void setup(){
+  pinMode(LED_BUILTIN,OUTPUT);
+  Serial.begin(115200);
+  GPSSerial.begin(9600);
+  SiKSerial.begin(57600);
+
+  recoverI2C();
+  delay(100);
+
+  Serial.println("\n--- TLV MK-01 Firmware Starting ---");
+  shtOK=initSHT();
+  Serial.print("[INIT] SHT31:  "); Serial.println(shtOK ? (String("OK (0x") + String(sht31Addr, HEX) + ")") : "FAIL");
+
+  mpuOK=initMPU();
+  Serial.print("[INIT] MPU6050: "); Serial.println(mpuOK ? (String("OK (0x") + String(mpuAddr, HEX) + ")") : "FAIL");
+
+  adxlOK=initADXL();
+  Serial.print("[INIT] ADXL375: "); Serial.println(adxlOK ? (String("OK (0x") + String(adxlAddr, HEX) + ")") : "FAIL");
+
+  msOK=initMS();
+  Serial.print("[INIT] MS5611:  "); Serial.println(msOK ? (String("OK (0x") + String(msAddr, HEX) + ")") : "FAIL");
+  Serial.println("-----------------------------------");
+}
+
+void loop(){
+  serviceGPS();
+  uint32_t now=millis();
+
+  // Retry failed sensor initialization every 1 second
+  if(now-lastRetry>=1000){
+    lastRetry=now;
+    if(!shtOK)  shtOK=initSHT();
+    if(!msOK)   msOK=initMS();
+    if(!mpuOK)  mpuOK=initMPU();
+    if(!adxlOK) adxlOK=initADXL();
+  }
+
+  // Read motion sensors at 50 Hz
+  if(now-lastSensor>=20){
+    lastSensor=millis();
+    if(mpuOK){
+      if(!readMPU()){
+        mpuAx=mpuAy=mpuAz=gyroX=gyroY=gyroZ=NAN;
+      } else {
+        updateOrientation();
+      }
+    } else {
+      mpuAx=mpuAy=mpuAz=gyroX=gyroY=gyroZ=NAN;
+    }
+
+    if(adxlOK){
+      if(!readADXL()){
+        adxlX=adxlY=adxlZ=NAN;
+      }
+    } else {
+      adxlX=adxlY=adxlZ=NAN;
+    }
+  }
+
+  // Environmental sensors and telemetry at 10 Hz
+  if(now-lastTelemetry>=100){
+    lastTelemetry=millis();
+    if(shtOK){
+      if(!readSHT()) temperatureC=humidity=NAN;
+    } else {
+      temperatureC=humidity=NAN;
+    }
+
+    if(msOK){
+      if(!readMS()) pressureHpa=baroAltM=NAN;
+    } else {
+      pressureHpa=baroAltM=NAN;
+    }
+
+    readBattery();
+    String p=packet();
+    SiKSerial.println(p);
+    Serial.println(p);
+    seqNo++;
+    digitalWrite(LED_BUILTIN,!digitalRead(LED_BUILTIN));
+  }
+}
